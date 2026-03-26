@@ -36,9 +36,11 @@ export class MemoryRecurringStorageAdapter implements RecurringStorageAdapter {
   private payments: Map<string, NormalizedRecurringPayment> = new Map();
   private cursor: RecurringCursor | null = null;
 
-  async getAll(filter?: RecurringFilter): Promise<NormalizedRecurringPayment[]> {
+  async getAll(
+    filter?: RecurringFilter,
+  ): Promise<NormalizedRecurringPayment[]> {
     let payments = Array.from(this.payments.values());
-    
+
     if (filter) {
       if (filter.status) {
         payments = payments.filter((p) => p.status === filter.status);
@@ -54,16 +56,16 @@ export class MemoryRecurringStorageAdapter implements RecurringStorageAdapter {
       }
       if (filter.minPaymentLedger !== undefined) {
         payments = payments.filter(
-          (p) => p.nextPaymentLedger >= filter.minPaymentLedger!
+          (p) => p.nextPaymentLedger >= filter.minPaymentLedger!,
         );
       }
       if (filter.maxPaymentLedger !== undefined) {
         payments = payments.filter(
-          (p) => p.nextPaymentLedger <= filter.maxPaymentLedger!
+          (p) => p.nextPaymentLedger <= filter.maxPaymentLedger!,
         );
       }
     }
-    
+
     return payments;
   }
 
@@ -95,11 +97,11 @@ export function transformRawRecurringPayment(
   raw: RawRecurringPayment,
   contractId: string,
   ledger: number,
-  existingPayment?: NormalizedRecurringPayment
+  existingPayment?: NormalizedRecurringPayment,
 ): NormalizedRecurringPayment {
   const now = new Date().toISOString();
   const events: RecurringEvent[] = existingPayment?.events ?? [];
-  
+
   // Determine status
   let status: RecurringStatus;
   if (!raw.is_active) {
@@ -153,7 +155,7 @@ export function transformRawRecurringPayment(
 
 /**
  * RecurringPaymentIndexerService
- * 
+ *
  * A background service that indexes recurring payment states from the contract.
  * Supports automation triggers, reminders, and reporting.
  */
@@ -163,11 +165,15 @@ export class RecurringIndexerService {
   private lastLedgerProcessed: number = 0;
   private consecutiveErrors: number = 0;
   private totalPaymentsIndexed: number = 0;
+  private readonly pageSize: number;
 
   constructor(
     private readonly env: BackendEnv,
     private readonly storage: RecurringStorageAdapter,
-  ) {}
+    pageSize: number = 100,
+  ) {
+    this.pageSize = pageSize;
+  }
 
   /**
    * Starts the indexing loop if enabled in config.
@@ -185,7 +191,7 @@ export class RecurringIndexerService {
       this.lastLedgerProcessed = lastCursor.lastLedger;
       this.totalPaymentsIndexed = (await this.storage.getAll()).length;
       console.log(
-        `[recurring-indexer] resuming from cursor: ledger ${this.lastLedgerProcessed}`
+        `[recurring-indexer] resuming from cursor: ledger ${this.lastLedgerProcessed}`,
       );
     } else {
       this.lastLedgerProcessed = 0;
@@ -231,7 +237,7 @@ export class RecurringIndexerService {
         this.consecutiveErrors++;
         console.error(
           `[recurring-indexer] sync error (attempt ${this.consecutiveErrors}):`,
-          error
+          error,
         );
       } finally {
         this.scheduleNextSync();
@@ -243,17 +249,23 @@ export class RecurringIndexerService {
    * Performs a sync cycle: fetches recurring payments and updates index.
    */
   public async sync(): Promise<void> {
-    // TODO: Implement RPC call to fetch recurring payments
-    // const payments = await this.rpcService.getRecurringPayments({
-    //   offset: 0,
-    //   limit: 100,
-    // });
+    const pageSize = this.pageSize;
+    let offset = 0;
+    let totalFetched = 0;
 
-    // Placeholder for development
-    const mockPayments: RawRecurringPayment[] = [];
+    while (true) {
+      const payments = await this.fetchPage(offset, pageSize);
+      if (payments.length === 0) break;
 
-    if (mockPayments.length > 0) {
-      await this.indexPayments(mockPayments);
+      await this.indexPayments(payments);
+      totalFetched += payments.length;
+      offset += payments.length;
+
+      if (payments.length < pageSize) break;
+    }
+
+    if (totalFetched > 0) {
+      console.log(`[recurring-indexer] synced ${totalFetched} payments`);
     }
 
     this.lastLedgerProcessed += 1;
@@ -264,6 +276,53 @@ export class RecurringIndexerService {
       lastLedger: this.lastLedgerProcessed,
       updatedAt: new Date().toISOString(),
     });
+  }
+
+  /**
+   * Fetches a single page of recurring payments from the RPC.
+   */
+  private async fetchPage(
+    offset: number,
+    limit: number,
+  ): Promise<RawRecurringPayment[]> {
+    const url = `${this.env.sorobanRpcUrl}`;
+    const body = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getContractData",
+      params: {
+        contract: this.env.contractId,
+        key: "recurring_payments",
+        durability: "persistent",
+        pagination: { offset, limit },
+      },
+    };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `[recurring-indexer] RPC error: ${response.status} ${response.statusText}`,
+      );
+    }
+
+    const json = (await response.json()) as {
+      result?: { entries?: RawRecurringPayment[] };
+      error?: { message: string };
+    };
+
+    if (json.error) {
+      throw new Error(
+        `[recurring-indexer] RPC returned error: ${json.error.message}`,
+      );
+    }
+
+    return json.result?.entries ?? [];
   }
 
   /**
@@ -278,7 +337,7 @@ export class RecurringIndexerService {
         raw,
         this.env.contractId,
         this.lastLedgerProcessed,
-        existing ?? undefined
+        existing ?? undefined,
       );
       await this.storage.save(normalized);
       this.totalPaymentsIndexed++;
@@ -288,7 +347,9 @@ export class RecurringIndexerService {
   /**
    * Manually sync a single payment by ID.
    */
-  public async syncPayment(_paymentId: string): Promise<NormalizedRecurringPayment | null> {
+  public async syncPayment(
+    _paymentId: string,
+  ): Promise<NormalizedRecurringPayment | null> {
     // TODO: Implement RPC call to get specific payment
     // const raw = await this.rpcService.getRecurringPayment(_paymentId);
     // if (!raw) return null;
@@ -302,7 +363,7 @@ export class RecurringIndexerService {
    * Get all indexed payments with optional filtering.
    */
   public async getPayments(
-    filter?: RecurringFilter
+    filter?: RecurringFilter,
   ): Promise<NormalizedRecurringPayment[]> {
     return this.storage.getAll(filter);
   }
@@ -310,7 +371,9 @@ export class RecurringIndexerService {
   /**
    * Get a single payment by ID.
    */
-  public async getPayment(paymentId: string): Promise<NormalizedRecurringPayment | null> {
+  public async getPayment(
+    paymentId: string,
+  ): Promise<NormalizedRecurringPayment | null> {
     return this.storage.getById(paymentId);
   }
 
