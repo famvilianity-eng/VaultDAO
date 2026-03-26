@@ -31,16 +31,15 @@ export function getReadinessController(
   env: BackendEnv,
   runtime: BackendRuntime,
 ): RequestHandler {
-  return (_request, response) => {
-    const payload = buildReadinessPayload(env, runtime);
+  return async (_request, response) => {
+    const payload = await buildReadinessPayload(env, runtime);
     if (payload.ready) {
       success(response, payload);
     } else {
-      error(response, { 
-        message: "Service not ready", 
-        status: 503 
+      error(response, {
+        message: "Service not ready",
+        status: 503,
       });
     }
   };
 }
-

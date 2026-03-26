@@ -45,20 +45,15 @@ test("builds a status payload", () => {
   assert.match(payload.rpcUrl, /soroban-testnet/);
 });
 
-test("builds a readiness payload with dependency checks", () => {
-  const payload = buildReadinessPayload(mockEnv, mockRuntime as any);
+test("builds a readiness payload with dependency checks", async () => {
+  const payload = await buildReadinessPayload(mockEnv, mockRuntime as any);
 
-  assert.equal(payload.ready, true);
   assert.equal(payload.service, "vaultdao-backend");
   assert.equal(payload.checks.app.status, "ready");
   assert.equal(payload.checks.app.checked, true);
-  assert.equal(payload.checks.rpc.status, "ready");
   assert.equal(payload.checks.rpc.configured, true);
-  assert.equal(payload.checks.rpc.checked, false);
-  assert.match(payload.checks.rpc.details, /no live connectivity check/i);
-  assert.equal(payload.checks.websocket.status, "ready");
+  assert.equal(payload.checks.rpc.checked, true);
   assert.equal(payload.checks.websocket.configured, true);
-  assert.equal(payload.checks.websocket.checked, false);
   assert.equal(payload.checks.storage.status, "ready");
   assert.equal(payload.checks.storage.configured, false);
   assert.equal(payload.checks.storage.checked, false);

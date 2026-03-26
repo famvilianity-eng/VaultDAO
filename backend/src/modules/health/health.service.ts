@@ -82,10 +82,44 @@ function getUptimeSeconds(startedAt: string): number {
   return Math.floor(uptimeMs / 1000);
 }
 
+const CHECK_CACHE_TTL_MS = 10_000;
+
+interface CachedCheck {
+  status: DependencyStatus;
+  checkedAt: number;
+}
+
+const checkCache = new Map<string, CachedCheck>();
+
+async function liveCheck(
+  url: string,
+  cacheKey: string,
+): Promise<DependencyStatus> {
+  const cached = checkCache.get(cacheKey);
+  if (cached && Date.now() - cached.checkedAt < CHECK_CACHE_TTL_MS) {
+    return cached.status;
+  }
+
+  let status: DependencyStatus;
+  try {
+    const res = await fetch(url, {
+      method: "HEAD",
+      signal: AbortSignal.timeout(3_000),
+    });
+    status = res.ok || res.status < 500 ? "ready" : "not_ready";
+  } catch {
+    status = "not_ready";
+  }
+
+  checkCache.set(cacheKey, { status, checkedAt: Date.now() });
+  return status;
+}
+
 function buildDependencyChecks(env: BackendEnv): ReadinessPayload["checks"] {
   const hasRpcUrl = env.sorobanRpcUrl.length > 0;
   const hasWebsocketUrl = env.websocketUrl.length > 0;
 
+  // Return synchronous shape; live checks are done in buildReadinessPayload
   return {
     app: {
       name: "app",
@@ -128,23 +162,65 @@ function buildDependencyChecks(env: BackendEnv): ReadinessPayload["checks"] {
   };
 }
 
-export function buildReadinessPayload(
+export async function buildReadinessPayload(
   env: BackendEnv,
   runtime: BackendRuntime,
-): ReadinessPayload {
+): Promise<ReadinessPayload> {
   const checks = buildDependencyChecks(env);
-  const requiredChecks = [checks.app, checks.rpc].every(
+
+  // Perform live RPC check
+  let rpcStatus: DependencyStatus = checks.rpc.status;
+  let rpcChecked = false;
+  if (env.sorobanRpcUrl.length > 0) {
+    rpcStatus = await liveCheck(env.sorobanRpcUrl, "rpc");
+    rpcChecked = true;
+  }
+
+  // Perform live WebSocket check (HTTP upgrade endpoint)
+  let wsStatus: DependencyStatus = checks.websocket.status;
+  let wsChecked = false;
+  if (env.websocketUrl.length > 0) {
+    const wsHttpUrl = env.websocketUrl.replace(/^ws(s?):\/\//, "http$1://");
+    wsStatus = await liveCheck(wsHttpUrl, "websocket");
+    wsChecked = true;
+  }
+
+  const liveChecks: ReadinessPayload["checks"] = {
+    ...checks,
+    rpc: {
+      ...checks.rpc,
+      status: rpcStatus,
+      checked: rpcChecked,
+      details: rpcChecked
+        ? rpcStatus === "ready"
+          ? "RPC endpoint is reachable."
+          : "RPC endpoint is not reachable."
+        : checks.rpc.details,
+    },
+    websocket: {
+      ...checks.websocket,
+      status: wsStatus,
+      checked: wsChecked,
+      details: wsChecked
+        ? wsStatus === "ready"
+          ? "WebSocket endpoint is reachable."
+          : "WebSocket endpoint is not reachable."
+        : checks.websocket.details,
+    },
+  };
+
+  const requiredReady = [liveChecks.app, liveChecks.rpc].every(
     (check) => check.status === "ready",
   );
 
   return {
-    ready: requiredChecks,
+    ready: requiredReady,
     service: "vaultdao-backend",
     version: VERSION,
     build: packageMetadata.build,
     environment: env.nodeEnv,
     timestamp: new Date().toISOString(),
     uptimeSeconds: getUptimeSeconds(runtime.startedAt),
-    checks,
+    checks: liveChecks,
   };
 }
